@@ -16,8 +16,16 @@ import random
 import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from prometheus_client import Counter, Histogram, make_asgi_app
 
 app = FastAPI(title="payment-service")
+app.mount("/metrics", make_asgi_app())
+
+# Counter labeled by outcome (success/declined/down) - this is what lets
+# a detector distinguish "payments are slow" from "payments are failing"
+# from "payment-service is unreachable", which need different responses.
+PAYMENTS_TOTAL = Counter("payments_total", "Total payments processed", ["status"])
+PAYMENT_LATENCY = Histogram("payment_latency_seconds", "Payment processing latency in seconds")
 
 # --- in-memory "is something wrong right now" state -------------------
 chaos_state = {
@@ -52,27 +60,35 @@ async def health():
 @app.post("/payments")
 async def process_payment(req: PaymentRequest):
     start = time.time()
+    status_label = "success"
+    try:
+        if chaos_state["down"]:
+            status_label = "down"
+            raise HTTPException(status_code=503, detail="service_down")
 
-    if chaos_state["down"]:
-       raise HTTPException(status_code=503, detail="service_down")
+        if chaos_state["latency_ms"] > 0:
+            await asyncio.sleep(chaos_state["latency_ms"] / 1000)
 
-    if chaos_state["latency_ms"] > 0:
-        await asyncio.sleep(chaos_state["latency_ms"] / 1000)
+        if chaos_state["error_rate"] > 0 and random.random() < chaos_state["error_rate"]:
+            status_label = "declined"
+            return {
+                "status": "failed",
+                "order_id": req.order_id,
+                "reason": "payment_declined",
+                "latency_ms": round((time.time() - start) * 1000, 1),
+            }
 
-    if chaos_state["error_rate"] > 0 and random.random() < chaos_state["error_rate"]:
         return {
-            "status": "failed",
+            "status": "success",
             "order_id": req.order_id,
-            "reason": "payment_declined",
+            "amount": req.amount,
             "latency_ms": round((time.time() - start) * 1000, 1),
         }
-
-    return {
-        "status": "success",
-        "order_id": req.order_id,
-        "amount": req.amount,
-        "latency_ms": round((time.time() - start) * 1000, 1),
-    }
+    finally:
+        # finally runs on every exit path - normal return OR the raised
+        # HTTPException above - so the "down" case gets counted too.
+        PAYMENTS_TOTAL.labels(status=status_label).inc()
+        PAYMENT_LATENCY.observe(time.time() - start)
 
 
 # --- chaos endpoints ----------------------------------------------------
