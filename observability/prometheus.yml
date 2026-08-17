@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "order-service"
+    static_configs:
+      - targets: ["order-service:8001"]
+
+  - job_name: "payment-service"
+    static_configs:
+      - targets: ["payment-service:8002"]
