@@ -22,9 +22,17 @@ import asyncpg
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
+from prometheus_client import Counter, Histogram, make_asgi_app
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 PAYMENT_SERVICE_URL = os.environ["PAYMENT_SERVICE_URL"]
+
+# --- Prometheus metrics ---------------------------------------------
+# Counter: how many orders, broken down by final status (completed/failed).
+# Histogram: end-to-end latency distribution, so we can compute p95/p99
+# later instead of just an average that hides outliers.
+ORDERS_TOTAL = Counter("orders_total", "Total orders processed", ["status"])
+ORDER_LATENCY = Histogram("order_latency_seconds", "End-to-end order latency in seconds")
 
 db_pool: asyncpg.Pool | None = None
 
@@ -50,6 +58,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="order-service", lifespan=lifespan)
+app.mount("/metrics", make_asgi_app())
 
 
 class OrderRequest(BaseModel):
@@ -99,6 +108,9 @@ async def create_order(req: OrderRequest):
             "UPDATE orders SET status = $1, payment_latency_ms = $2 WHERE id = $3",
             final_status, total_latency_ms, order_id,
         )
+
+    ORDERS_TOTAL.labels(status=final_status).inc()
+    ORDER_LATENCY.observe(total_latency_ms / 1000)
 
     return {
         "order_id": str(order_id),
