@@ -17,6 +17,7 @@ from rich.table import Table
 from rich.live import Live
 
 GATEWAY_URL = "http://localhost:8000"
+DETECTOR_URL = "http://localhost:8003"
 
 
 def fetch_state():
@@ -29,10 +30,14 @@ def fetch_state():
             stats = client.get(f"{GATEWAY_URL}/api/stats").json()
         except Exception:
             stats = {}
-    return health, stats
+        try:
+            alerts = client.get(f"{DETECTOR_URL}/alerts").json().get("active_alerts", {})
+        except Exception:
+            alerts = {}
+    return health, stats, alerts
 
 
-def render(health, stats):
+def render(health, stats, alerts):
     table = Table(title="Sentinel - live system status (last 60s)")
     table.add_column("Service")
     table.add_column("Status")
@@ -60,6 +65,9 @@ def render(health, stats):
             f"avg latency {info['avg_latency_ms']:.0f}ms",
         )
 
+    for rule_name, info in alerts.items():
+        table.add_row(f"[bold red]ALERT: {rule_name}[/bold red]", "[red]firing[/red]", info.get("message", ""))
+
     return table
 
 
@@ -67,8 +75,8 @@ def main():
     console = Console()
     with Live(console=console, refresh_per_second=2) as live:
         while True:
-            health, stats = fetch_state()
-            live.update(render(health, stats))
+            health, stats, alerts = fetch_state()
+            live.update(render(health, stats, alerts))
             time.sleep(1)
 
 
