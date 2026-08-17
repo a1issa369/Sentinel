@@ -1,22 +1,33 @@
-# Sentinel — Phase 1: the skeleton
+# Sentinel — Phase 2: observability + automatic detection
 
-A minimal microservice system you can deliberately break and watch break.
-No AI, no Kubernetes, no observability stack yet — that's Phase 2 and 3.
-The only goal here: **inject a fault, see it happen, in real time.**
+Phase 1 proved the fault-injection loop works, but *you* had to watch the
+terminal table to notice something broke. Phase 2 adds real metrics
+(Prometheus), a dashboard you'd actually show someone (Grafana), and a
+detection engine that watches those metrics and fires alerts on its own.
+Phase 3 (AI diagnosis) builds directly on top of this.
 
 ## Architecture
 
 ```
 traffic-generator --> gateway --> order-service --> payment-service
-                                        |
-                                    postgres
+                                        |                  |
+                                    postgres          (both expose /metrics)
+                                        |                  |
+                                        +------> prometheus <------+
+                                                    |
+                                            +-------+-------+
+                                            |               |
+                                        grafana          detector
 ```
 
 - **gateway** (`:8000`) — single entry point, aggregates `/health` across services
-- **order-service** (`:8001`) — creates orders, calls payment-service, writes to Postgres
-- **payment-service** (`:8002`) — processes payments, has `/chaos/*` fault-injection endpoints
+- **order-service** (`:8001`) — creates orders, calls payment-service, writes to Postgres, exposes `/metrics`
+- **payment-service** (`:8002`) — processes payments, has `/chaos/*` fault-injection endpoints, exposes `/metrics`
 - **traffic-generator** — background script hitting the gateway continuously so there's always live signal
-- **dashboard** — runs on your host (not in Docker), polls `/health` and `/api/stats` and renders a live table
+- **prometheus** (`:9090`) — scrapes `/metrics` from order-service and payment-service every 5s
+- **grafana** (`:3000`) — pre-provisioned dashboard reading from Prometheus, no manual setup needed
+- **detector** (`:8003`) — polls Prometheus every 5s, evaluates 3 threshold rules, exposes `/alerts`
+- **dashboard** — runs on your host (not in Docker), polls `/health`, `/api/stats`, and now `/alerts` too
 
 ## Running it
 
@@ -46,7 +57,20 @@ python dashboard/chaos.py down          # payment-service goes fully unavailable
 python dashboard/chaos.py reset         # back to healthy
 ```
 
-Watch the dashboard react: latency climbs, the order failure count climbs, gateway's aggregate health flips to `degraded`. This loop — inject, observe, reset — is the whole story of Phase 1, and it's also exactly the loop Phase 2 (automated detection) and Phase 3 (AI diagnosis) build on top of.
+Watch the dashboard react: latency climbs, the order failure count climbs, gateway's aggregate health flips to `degraded`. Now, with Phase 2 running, keep watching after you inject — within ~10-15 seconds (2-3 detector poll cycles) a red `ALERT: <rule_name>` row should appear in the dashboard *on its own*, without you deciding anything is wrong. That's the actual Phase 2 milestone: detection moved from your eyes to code.
+
+**Detector rules** (in `detector/detector.py`):
+- `high_latency` — p95 order latency above 300ms
+- `high_error_rate` — order failure rate above 20%
+- `payment_service_down` — Prometheus can't scrape payment-service at all
+
+Try each chaos command and confirm the *matching* rule fires — `latency 800` should trigger `high_latency` but not `high_error_rate`, and vice versa for `errors 0.5`. If a rule fires for the wrong reason, that's useful signal about how coarse your thresholds are — a good thing to be able to discuss.
+
+## Grafana and Prometheus
+
+- **Grafana**: http://localhost:3000 — logs in anonymously as Admin (no password needed, this is fine for local demo purposes only — never do this in production). Open "Sentinel overview" from the dashboard list; it's pre-provisioned, no manual setup. Four panels: order p95 latency, order failure rate, payments by outcome, and service up/down.
+- **Prometheus**: http://localhost:9090 — useful for testing PromQL queries directly before you put them in a dashboard panel or detector rule. Try the query bar with `orders_total` or `up` to see raw scraped data.
+- **Detector API**: http://localhost:8003/alerts — raw JSON of current alert state, same data the dashboard is polling.
 
 ## What each design choice is teaching you
 
@@ -61,6 +85,13 @@ Watch the dashboard react: latency climbs, the order failure count climbs, gatew
 - `docker compose logs -f payment-service` (swap the service name) is your best friend for debugging any single service.
 - If ports 8000-8002 or 5432 are already in use on your machine, edit the `ports:` mappings in `docker-compose.yml`.
 
-## Next: Phase 2
+## What Phase 2's design choices are teaching you
 
-Once this is solid and you can explain every file, Phase 2 adds OpenTelemetry instrumentation, Prometheus + Grafana, and a rule-based detection engine that automatically notices when `dashboard/chaos.py` has been run — instead of you having to look at the table yourself.
+- **Why a Histogram instead of just averaging latency yourself?** Prometheus histograms let you compute *any* percentile after the fact (`histogram_quantile(0.95, ...)`, `0.99`, `0.5`) from the same stored buckets. An average hides outliers — if 95% of requests are fast and 5% are catastrophically slow, the average can still look fine. p95/p99 is what real SRE teams actually alert on, not averages.
+- **Why does the detector poll Prometheus instead of querying order-service/payment-service directly?** Decoupling. The detector doesn't need to know how many services exist or where they live — it asks Prometheus one question ("what's the p95 latency") and Prometheus already did the work of collecting and storing that from every scrape target. Add a fourth service later and the detector's rules don't change at all.
+- **Why hardcoded thresholds instead of something smarter?** Because Phase 2's job is to prove the *loop* — metric change → detection → alert → resolution — actually works end to end, reliably, before adding any intelligence on top. Phase 3 replaces `value > 0.3` with an LLM that can say *why* latency is high and *what* to do about it. Skipping straight to AI without this baseline would make it much harder to tell whether Phase 3 is actually working, or just guessing.
+- **Why `GF_AUTH_ANONYMOUS_ENABLED: true` on Grafana?** Pure demo convenience — skips a login screen for local development. Worth stating out loud in an interview that you know this is a "never do this in production" shortcut, not something you didn't think about.
+
+## Next: Phase 3
+
+With detection working, Phase 3 adds an LLM with tool-calling access to the same Prometheus data the detector already reads. Instead of a flat "high_latency alert fired," it produces something like *"payment-service p95 latency is 850ms, up from a 20ms baseline, correlated with the down flag in payment-service's chaos state — recommend investigating or rolling back."* You approve or reject the suggested remediation, and the system acts.
