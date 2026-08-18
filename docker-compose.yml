@@ -88,5 +88,17 @@ services:
     depends_on:
       - prometheus
 
+  ai-agent:
+    build: ./ai-agent
+    ports:
+      - "8004:8004"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      PROMETHEUS_URL: http://prometheus:9090
+      DETECTOR_URL: http://detector:8003
+      PAYMENT_SERVICE_URL: http://payment-service:8002
+    depends_on:
+      - detector
+
 volumes:
   pgdata:
